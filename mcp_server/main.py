@@ -3,14 +3,7 @@ import logging
 from typing import Any
 from mcp.server.fastmcp import FastMCP
 import httpx
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+import sys
 
 
 # ===== ADD THIS LOGGING CONFIGURATION HERE =====
@@ -27,6 +20,138 @@ logger = logging.getLogger(__name__)
 # ===============================================
 # Initialize MCP server
 mcp = FastMCP("audio-timbre-transfer")
+import asyncio
+import httpx
+
+import os
+import threading
+import uuid
+import logging
+
+jobs = {}  # In-memory job store - replace with persistent store in production
+logger = logging.getLogger(__name__)
+
+def background_process(job_id, audio_bytes, instrument, song_name, output_dir):
+    import httpx
+    try:
+        logger.info(f"Job {job_id} started processing.")
+        files = {
+            "audio": (f"{song_name}.wav", audio_bytes, "audio/wav")
+        }
+        data = {
+            "instrument": instrument,
+            "songName": song_name
+        }
+        headers = {"ngrok-skip-browser-warning": "true"}
+
+        with httpx.Client(timeout=300.0) as client:
+            response = client.post(
+                "https://oddly-uncommon-mastiff.ngrok-free.app/api/v1/transfer-audio",
+                files=files,
+                data=data,
+                headers=headers
+            )
+        if response.status_code == 200:
+            os.makedirs(output_dir, exist_ok=True)
+            output_filename = f"converted_{song_name}_{instrument}.wav"
+            # output_path = os.path.join(output_dir, output_filename)
+            output_path = os.path.abspath(os.path.join(output_dir, output_filename))
+            with open(output_path, "wb") as f_out:
+                f_out.write(response.content)
+            logger.info(f"Converted audio file saved at: {output_path}")
+
+            # with open(output_path, "wb") as f_out:
+            #     f_out.write(response.content)
+
+            jobs[job_id]['status'] = 'done'
+            jobs[job_id]['output_path'] = output_path
+            logger.info(f"Job {job_id} completed successfully.")
+        else:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['error'] = f"API returned status {response.status_code}: {response.text}"
+            logger.error(f"Job {job_id} failed with API error: {response.status_code}")
+    except Exception as e:
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['error'] = str(e)
+        logger.exception(f"Job {job_id} raised exception.")
+
+@mcp.tool()
+async def timbre_audio_transfer(
+    audio_file_path: str,
+    target_instrument: str,
+    song_name: str = "unknown",
+    output_dir: str = "./converted_audios"
+) -> dict:
+    """
+    Submit the audio timbre transfer job asynchronously.
+    Returns job_id immediately.
+    """
+    audio_file_path = os.path.normpath(audio_file_path)
+    if not os.path.exists(audio_file_path):
+        raise FileNotFoundError(f"Input audio file does not exist: {audio_file_path}")
+
+    with open(audio_file_path, "rb") as f:
+        audio_bytes = f.read()
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        'status': 'pending',
+        'output_path': None,
+        'error': None,
+        'instrument': target_instrument,
+        'song_name': song_name
+    }
+
+    thread = threading.Thread(
+        target=background_process, 
+        args=(job_id, audio_bytes, target_instrument, song_name, output_dir),
+        daemon=True
+    )
+    thread.start()
+
+    return {"job_id": job_id, "status": "pending, check back later the staus of the job- {job_id}"}
+
+@mcp.tool()
+async def check_job_status(job_id: str) -> dict:
+    """
+    Check status of a submitted timbre transfer job.
+    Returns status and, if done, output path or error details.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return {"status": "not_found", "message": "Job ID not found."}
+    return {
+        "status": job['status'],
+        "output_path": job.get('output_path'),
+        "error": job.get('error')
+    }
+
+@mcp.tool()
+async def test_file_path_access(audio_file_path: str) -> dict:
+    """
+    Checks if the given audio file path exists and is readable.
+
+    Args:
+        audio_file_path: Path to the audio file you want to check.
+
+    Returns:
+        Dict with 'exists' (bool) and 'error' (str or None).
+    """
+    import os
+    logger.info(f"Testing file path access for: {audio_file_path}")
+    try:
+        normalized_path = os.path.normpath(audio_file_path)
+        exists = os.path.exists(normalized_path)
+        if not exists:
+            return {"exists": False, "error": f"File does not exist at path: {normalized_path}"}
+        # Try to open the file to check readability
+        with open(normalized_path, "rb") as f:
+            f.read(1)  # try reading a byte to confirm permission
+        return {"exists": True, "error": None}
+    except Exception as e:
+        return {"exists": False, "error": f"Error accessing file: {str(e)}"}
+
+
 
 @mcp.tool()
 async def check_server_health(
@@ -41,6 +166,9 @@ async def check_server_health(
     Returns:
         A dictionary with the HTTP status code and health response, or error details.
     """
+    logger.info(f"Checking server health at {url}")
+    print(f"DEBUG: Checking server health at {url}", file=sys.stderr)
+    sys.stderr.flush()
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(url, headers={"ngrok-skip-browser-warning": "true"}, timeout=10.0)
@@ -53,69 +181,6 @@ async def check_server_health(
             "status_code": None,
             "error": str(e)
         }
-    
-@mcp.tool()
-async def transfer_audio_timbre(
-    audio_file_path: str,        # Path to the input raw audio file (.wav, .m4a, etc.)
-    target_instrument: str,      # Target instrument (e.g., 'Violin', 'Flute', etc.)
-    song_name: str = "unknown",  # Optional song name for naming output
-    output_dir: str = "./converted_audios"  # Directory to save converted audio output
-) -> str:
-    """
-    Convert audio to a different instrument timbre using DDSP.
-    """
-    try:
-        audio_file_path = os.path.normpath(audio_file_path)
-        logger.info(f"Received transfer_audio_timbre request: audio_file_path={audio_file_path}, "
-                    f"target_instrument={target_instrument}, song_name={song_name}, output_dir={output_dir}")
-
-        if not os.path.exists(audio_file_path):
-            logger.error(f"Input audio file does not exist: {audio_file_path}")
-            raise FileNotFoundError(f"Input audio file does not exist: {audio_file_path}")
-
-        # Ensure output directory exists
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Read input audio file bytes and prepare multipart/form-data
-        with open(audio_file_path, "rb") as audio_file:
-            files = {
-                "audio": (os.path.basename(audio_file_path), audio_file, "audio/wav")
-            }
-            data = {
-                "instrument": target_instrument,
-                "songName": song_name
-            }
-            headers = {
-                "ngrok-skip-browser-warning": "true"
-            }
-
-            logger.info(f"Sending request to timbre transfer API for instrument: {target_instrument}")
-            async with httpx.AsyncClient() as client:
-                # Replace with your actual public ngrok tunnel URL
-                response = await client.post(
-                    "http://oddly-uncommon-mastiff.ngrok-free.app/api/v1/transfer-audio",
-                    files=files,
-                    data=data,
-                    headers=headers,
-                    timeout=300.0  # 5-minute timeout for audio processing
-                )
-
-            logger.info(f"Received response with status code: {response.status_code}")
-
-        if response.status_code == 200:
-            output_filename = f"converted_{song_name}_{target_instrument}.wav"
-            output_path = os.path.join(output_dir, output_filename)
-            with open(output_path, "wb") as f_out:
-                f_out.write(response.content)
-            logger.info(f"Saved converted audio file to: {output_path}")
-            return output_path
-        else:
-            logger.error(f"API call failed with status {response.status_code}: {response.text}")
-            raise Exception(f"API call failed with status {response.status_code}: {response.text}")
-
-    except Exception as e:
-        logger.exception(f"Exception in transfer_audio_timbre: {e}")
-        raise
 
 
 @mcp.tool()
